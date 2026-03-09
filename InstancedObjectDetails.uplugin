@@ -5,7 +5,7 @@
 	"FriendlyName": "Instanced Object BP Filter",
 	"Description": "Hides Blueprint-defined properties on instanced (EditInlineNew) UObjects behind a visibility toggle in the Details panel.",
 	"Category": "Editor",
-	"CreatedBy": "",
+	"CreatedBy": "PsinaDev",
 	"CanContainContent": false,
 	"IsBetaVersion": false,
 	"Installed": false,
@@ -16,4 +16,5 @@
 			"LoadingPhase": "PostEngineInit"
 		}
 	]
+
 }
