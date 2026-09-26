@@ -6,7 +6,6 @@
 #include "PropertyEditorModule.h"
 
 class IPropertyHandle;
-class IPropertyUtilities;
 class IDetailChildrenBuilder;
 class FDetailWidgetRow;
 class IPropertyTypeCustomizationUtils;
@@ -25,7 +24,7 @@ public:
  *
  * Header: default class picker + "Show In Content Browser" button
  *         (visible only when the assigned class is a Blueprint).
- * Children: filters by CPF_Edit / CPF_DisableEditOnInstance, groups by category.
+ * Children: re-groups the sub-object's leaves into nested categories.
  */
 class FInstancedObjectPropertyCustomization : public IPropertyTypeCustomization
 {
@@ -41,17 +40,11 @@ public:
 		IPropertyTypeCustomizationUtils& CustomizationUtils) override;
 
 private:
-	/** Checks if the currently assigned object is a Blueprint-generated class. */
-	bool IsCurrentValueBlueprintClass() const;
-
-	/** Navigates Content Browser to the Blueprint asset of the current value. */
-	void BrowseToBlueprint() const;
-
 	/**
-	 * Returns true if the property should be visible on an instanced object.
-	 * Requires CPF_Edit and no CPF_DisableEditOnInstance.
+	 * Returns true if the property should be visible.
+	 * Requires CPF_Edit; EditInstanceOnly is dropped only in template context.
 	 */
-	static bool ShouldShowProperty(const FProperty* Property);
+	static bool ShouldShowProperty(const FProperty* Property, bool bTemplateContext);
 
 	/**
 	 * Recursively walks property handle tree, skipping intermediate nodes
@@ -59,7 +52,12 @@ private:
 	 */
 	static void GatherLeafProperties(
 		TSharedRef<IPropertyHandle> ParentHandle,
-		TArray<TSharedRef<IPropertyHandle>>& OutProperties);
+		TArray<TSharedRef<IPropertyHandle>>& OutProperties,
+		bool bTemplateContext);
 
-	TSharedPtr<IPropertyHandle> CachedPropertyHandle;
+	/**
+	 * Returns true when the edited instanced sub-object is a CDO/archetype or lives inside one.
+	 * Assets are not templates: a UDataAsset such as UInputAction is a plain object instance.
+	 */
+	static bool ResolveTemplateContext(const IPropertyHandle& PropertyHandle);
 };

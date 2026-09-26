@@ -10,12 +10,17 @@ public class InstancedObjectDetails : ModuleRules
 		{
 			"Core",
 			"CoreUObject",
+			"PropertyEditor",
+		});
+
+		PrivateDependencyModuleNames.AddRange(new string[]
+		{
 			"Engine",
 			"Slate",
 			"SlateCore",
 			"InputCore",
-			"PropertyEditor",
 			"ContentBrowser",
+			"GameplayTags",
 		});
 	}
 }

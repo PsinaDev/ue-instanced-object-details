@@ -3,18 +3,94 @@
 #include "InstancedObjectPropertyCustomization.h"
 #include "DetailWidgetRow.h"
 #include "IDetailChildrenBuilder.h"
-#include "IDetailGroup.h"
-#include "IPropertyUtilities.h"
+#include "IDetailCustomNodeBuilder.h"
 #include "PropertyHandle.h"
 #include "Engine/BlueprintGeneratedClass.h"
+#include "GameplayTagContainer.h"
 #include "UObject/UnrealType.h"
 #include "ContentBrowserModule.h"
 #include "IContentBrowserSingleton.h"
 #include "Styling/AppStyle.h"
 #include "Widgets/Images/SImage.h"
 #include "Widgets/Input/SButton.h"
+#include "Widgets/Text/STextBlock.h"
 
 #define LOCTEXT_NAMESPACE "InstancedObjectBPFilter"
+
+#pragma region CategoryBuilder
+
+namespace
+{
+	struct FCategoryNode
+	{
+		TArray<TSharedRef<IPropertyHandle>> Properties;
+		TMap<FString, TSharedPtr<FCategoryNode>> Children;
+		TArray<FString> ChildOrder;
+	};
+
+	/**
+	 * Renders a category and its subtree using IDetailCustomNodeBuilder so that every leaf
+	 * is added through IDetailChildrenBuilder::AddProperty. This preserves the underlying
+	 * FObjectInstancePropertyNode chain that struct customizations relying on
+	 * IPropertyHandle::AccessRawData / GetOuterObjects depend on (e.g. FGameplayTagQuery,
+	 * FGameplayTagContainer, FInstancedStruct). Routing those leaves through
+	 * IDetailGroup::AddPropertyRow corrupts the chain and AccessRawData returns no data.
+	 */
+	class FInstancedObjectCategoryBuilder : public IDetailCustomNodeBuilder
+	{
+	public:
+		FInstancedObjectCategoryBuilder(FName InName, FText InDisplayName, TSharedRef<FCategoryNode> InNode)
+			: NodeName(InName)
+			, DisplayName(MoveTemp(InDisplayName))
+			, Node(MoveTemp(InNode))
+		{
+		}
+
+		virtual void SetOnRebuildChildren(FSimpleDelegate InOnRegenerateChildren) override {}
+		virtual void Tick(float DeltaTime) override {}
+		virtual bool RequiresTick() const override { return false; }
+		virtual bool InitiallyCollapsed() const override { return false; }
+		virtual FName GetName() const override { return NodeName; }
+
+		virtual void GenerateHeaderRowContent(FDetailWidgetRow& NodeRow) override
+		{
+			NodeRow
+				.NameContent()
+				[
+					SNew(STextBlock)
+					.Text(DisplayName)
+					.Font(FAppStyle::Get().GetFontStyle(TEXT("PropertyWindow.NormalFont")))
+				];
+		}
+
+		virtual void GenerateChildContent(IDetailChildrenBuilder& ChildrenBuilder) override
+		{
+			for (const TSharedRef<IPropertyHandle>& Prop : Node->Properties)
+			{
+				ChildrenBuilder.AddProperty(Prop);
+			}
+
+			for (const FString& ChildName : Node->ChildOrder)
+			{
+				const TSharedPtr<FCategoryNode> ChildNode = Node->Children.FindRef(ChildName);
+				if (!ChildNode.IsValid())
+				{
+					continue;
+				}
+
+				ChildrenBuilder.AddCustomBuilder(MakeShared<FInstancedObjectCategoryBuilder>(
+					FName(*ChildName), FText::FromString(ChildName), ChildNode.ToSharedRef()));
+			}
+		}
+
+	private:
+		FName NodeName;
+		FText DisplayName;
+		TSharedRef<FCategoryNode> Node;
+	};
+}
+
+#pragma endregion
 
 #pragma region Identifier
 
@@ -31,7 +107,30 @@ bool FInstancedObjectPropertyIdentifier::IsPropertyTypeCustomized(const IPropert
 		return false;
 	}
 
-	return CastField<FObjectPropertyBase>(Property) != nullptr;
+	if (!CastField<FObjectPropertyBase>(Property))
+	{
+		return false;
+	}
+
+	// Re-grouping the Tag Query Editor's transient expression objects by category empties the expression body.
+	TArray<UObject*> OuterObjects;
+	PropertyHandle.GetOuterObjects(OuterObjects);
+	for (const UObject* Outer : OuterObjects)
+	{
+		if (!Outer)
+		{
+			continue;
+		}
+
+		const UClass* OuterClass = Outer->GetClass();
+		if (OuterClass->IsChildOf(UEditableGameplayTagQuery::StaticClass())
+			|| OuterClass->IsChildOf(UEditableGameplayTagQueryExpression::StaticClass()))
+		{
+			return false;
+		}
+	}
+
+	return true;
 }
 
 #pragma endregion
@@ -48,7 +147,7 @@ void FInstancedObjectPropertyCustomization::CustomizeHeader(
 	FDetailWidgetRow& HeaderRow,
 	IPropertyTypeCustomizationUtils& CustomizationUtils)
 {
-	CachedPropertyHandle = PropertyHandle;
+	TWeakPtr<IPropertyHandle> WeakHandle = PropertyHandle;
 
 	HeaderRow
 		.NameContent()
@@ -74,17 +173,54 @@ void FInstancedObjectPropertyCustomization::CustomizeHeader(
 			[
 				SNew(SButton)
 				.ButtonStyle(FAppStyle::Get(), "SimpleButton")
-				.OnClicked_Lambda([this]() -> FReply
+				.OnClicked_Lambda([WeakHandle]() -> FReply
 				{
-					BrowseToBlueprint();
+					TSharedPtr<IPropertyHandle> Handle = WeakHandle.Pin();
+					if (!Handle.IsValid())
+					{
+						return FReply::Handled();
+					}
+
+					UObject* Value = nullptr;
+					Handle->GetValue(Value);
+					if (!Value)
+					{
+						return FReply::Handled();
+					}
+
+					UClass* Class = Value->GetClass();
+					UObject* Blueprint = Class ? Class->ClassGeneratedBy : nullptr;
+					if (Blueprint)
+					{
+						FContentBrowserModule& ContentBrowserModule =
+							FModuleManager::LoadModuleChecked<FContentBrowserModule>("ContentBrowser");
+						ContentBrowserModule.Get().SyncBrowserToAssets({ FAssetData(Blueprint) });
+					}
+
 					return FReply::Handled();
 				})
 				.ToolTipText(LOCTEXT("BrowseToBlueprint", "Browse to Blueprint in Content Browser"))
-				.Visibility_Lambda([this]() -> EVisibility
+				.Visibility_Lambda([WeakHandle]() -> EVisibility
 				{
-					return IsCurrentValueBlueprintClass()
-						? EVisibility::Visible
-						: EVisibility::Collapsed;
+					TSharedPtr<IPropertyHandle> Handle = WeakHandle.Pin();
+					if (!Handle.IsValid())
+					{
+						return EVisibility::Collapsed;
+					}
+
+					UObject* Value = nullptr;
+					Handle->GetValue(Value);
+					if (!Value)
+					{
+						return EVisibility::Collapsed;
+					}
+
+					UClass* Class = Value->GetClass();
+					const bool bIsBlueprintClass =
+						Cast<UBlueprintGeneratedClass>(Class) != nullptr
+						&& Class->ClassGeneratedBy != nullptr;
+
+					return bIsBlueprintClass ? EVisibility::Visible : EVisibility::Collapsed;
 				})
 				[
 					SNew(SImage)
@@ -100,18 +236,12 @@ void FInstancedObjectPropertyCustomization::CustomizeChildren(
 	IDetailChildrenBuilder& ChildBuilder,
 	IPropertyTypeCustomizationUtils& CustomizationUtils)
 {
+	const bool bTemplateContext = ResolveTemplateContext(*PropertyHandle);
+
 	TArray<TSharedRef<IPropertyHandle>> LeafProperties;
-	GatherLeafProperties(PropertyHandle, LeafProperties);
+	GatherLeafProperties(PropertyHandle, LeafProperties, bTemplateContext);
 
-	// Build category tree from |-delimited paths.
-	struct FCategoryNode
-	{
-		TArray<TSharedRef<IPropertyHandle>> Properties;
-		TMap<FString, TSharedPtr<FCategoryNode>> Children;
-		TArray<FString> ChildOrder;
-	};
-
-	TSharedPtr<FCategoryNode> Root = MakeShared<FCategoryNode>();
+	const TSharedRef<FCategoryNode> Root = MakeShared<FCategoryNode>();
 	bool bHasMultipleCategories = false;
 
 	for (const TSharedRef<IPropertyHandle>& Child : LeafProperties)
@@ -134,7 +264,7 @@ void FInstancedObjectPropertyCustomization::CustomizeChildren(
 		TArray<FString> Segments;
 		CategoryPath.ParseIntoArray(Segments, TEXT("|"), true);
 
-		FCategoryNode* Current = Root.Get();
+		FCategoryNode* Current = &Root.Get();
 		for (const FString& Segment : Segments)
 		{
 			TSharedPtr<FCategoryNode>& ChildNode = Current->Children.FindOrAdd(Segment);
@@ -159,115 +289,47 @@ void FInstancedObjectPropertyCustomization::CustomizeChildren(
 		return;
 	}
 
-	// Recursive lambda to emit groups.
-	TFunction<void(FCategoryNode*, IDetailChildrenBuilder*, IDetailGroup*)> EmitNode;
-	EmitNode = [&EmitNode](FCategoryNode* Node, IDetailChildrenBuilder* Builder, IDetailGroup* ParentGroup)
+	// Root-level (uncategorized) leaves first.
+	for (const TSharedRef<IPropertyHandle>& Prop : Root->Properties)
 	{
-		// Properties at this level.
-		for (const TSharedRef<IPropertyHandle>& Prop : Node->Properties)
+		ChildBuilder.AddProperty(Prop);
+	}
+
+	// Sub-categories rendered through IDetailCustomNodeBuilder. Going through IDetailGroup
+	// would re-route leaves via IDetailGroup::AddPropertyRow, breaking the property-node
+	// chain that struct customizations like FGameplayTagQueryCustomization rely on
+	// (AccessRawData / GetOuterObjects would return nothing and the value would not display).
+	for (const FString& ChildName : Root->ChildOrder)
+	{
+		const TSharedPtr<FCategoryNode> ChildNode = Root->Children.FindRef(ChildName);
+		if (!ChildNode.IsValid())
 		{
-			if (ParentGroup)
-			{
-				ParentGroup->AddPropertyRow(Prop);
-			}
-			else
-			{
-				Builder->AddProperty(Prop);
-			}
+			continue;
 		}
 
-		// Sub-categories.
-		for (const FString& ChildName : Node->ChildOrder)
-		{
-			FCategoryNode* ChildNode = Node->Children[ChildName].Get();
-			const FName GroupName(*ChildName);
-			const FText DisplayName = FText::FromString(ChildName);
-
-			IDetailGroup* NewGroup;
-			if (ParentGroup)
-			{
-				NewGroup = &ParentGroup->AddGroup(GroupName, DisplayName);
-			}
-			else
-			{
-				NewGroup = &Builder->AddGroup(GroupName, DisplayName);
-			}
-
-			EmitNode(ChildNode, Builder, NewGroup);
-		}
-	};
-
-	EmitNode(Root.Get(), &ChildBuilder, nullptr);
+		ChildBuilder.AddCustomBuilder(MakeShared<FInstancedObjectCategoryBuilder>(
+			FName(*ChildName), FText::FromString(ChildName), ChildNode.ToSharedRef()));
+	}
 }
 
 #pragma endregion
 
 #pragma region Helpers
 
-bool FInstancedObjectPropertyCustomization::IsCurrentValueBlueprintClass() const
-{
-	if (!CachedPropertyHandle.IsValid())
-	{
-		return false;
-	}
-
-	UObject* CurrentValue = nullptr;
-	CachedPropertyHandle->GetValue(CurrentValue);
-
-	if (!CurrentValue)
-	{
-		return false;
-	}
-
-	UClass* Class = CurrentValue->GetClass();
-	return Cast<UBlueprintGeneratedClass>(Class) != nullptr
-		&& Class->ClassGeneratedBy != nullptr;
-}
-
-void FInstancedObjectPropertyCustomization::BrowseToBlueprint() const
-{
-	if (!CachedPropertyHandle.IsValid())
-	{
-		return;
-	}
-
-	UObject* CurrentValue = nullptr;
-	CachedPropertyHandle->GetValue(CurrentValue);
-	if (!CurrentValue)
-	{
-		return;
-	}
-
-	UClass* Class = CurrentValue->GetClass();
-	UObject* Blueprint = Class ? Class->ClassGeneratedBy : nullptr;
-	if (!Blueprint)
-	{
-		return;
-	}
-
-	TArray<FAssetData> Assets;
-	Assets.Add(FAssetData(Blueprint));
-
-	FContentBrowserModule& ContentBrowserModule =
-		FModuleManager::LoadModuleChecked<FContentBrowserModule>("ContentBrowser");
-	ContentBrowserModule.Get().SyncBrowserToAssets(Assets);
-}
-
-bool FInstancedObjectPropertyCustomization::ShouldShowProperty(const FProperty* Property)
+bool FInstancedObjectPropertyCustomization::ShouldShowProperty(const FProperty* Property, bool bTemplateContext)
 {
 	if (!Property)
 	{
 		return false;
 	}
 
-	// Must be editable to appear in Details panel.
-	if (!Property->HasAllPropertyFlags(CPF_Edit))
+	if (!Property->HasAnyPropertyFlags(CPF_Edit))
 	{
 		return false;
 	}
 
-	// Instanced objects are instances by definition — skip DisableEditOnInstance properties.
-	if (Property->HasAllPropertyFlags(CPF_DisableEditOnInstance))
+	// CPF_DisableEditOnInstance is already filtered by PropertyEditorHelpers::ShouldBeVisible when these child nodes are built; CPF_DisableEditOnTemplate is not.
+	if (bTemplateContext && Property->HasAnyPropertyFlags(CPF_DisableEditOnTemplate))
 	{
 		return false;
 	}
@@ -277,7 +339,8 @@ bool FInstancedObjectPropertyCustomization::ShouldShowProperty(const FProperty* 
 
 void FInstancedObjectPropertyCustomization::GatherLeafProperties(
 	TSharedRef<IPropertyHandle> ParentHandle,
-	TArray<TSharedRef<IPropertyHandle>>& OutProperties)
+	TArray<TSharedRef<IPropertyHandle>>& OutProperties,
+	bool bTemplateContext)
 {
 	const FProperty* ParentProp = ParentHandle->GetProperty();
 
@@ -301,18 +364,39 @@ void FInstancedObjectPropertyCustomization::GatherLeafProperties(
 
 		if (bIsIntermediateNode)
 		{
-			GatherLeafProperties(ChildHandle.ToSharedRef(), OutProperties);
+			GatherLeafProperties(ChildHandle.ToSharedRef(), OutProperties, bTemplateContext);
 			continue;
 		}
 
-		// Filter by editability: CPF_Edit required, CPF_DisableEditOnInstance excluded.
-		if (!ShouldShowProperty(ChildProp))
+		if (!ShouldShowProperty(ChildProp, bTemplateContext))
 		{
 			continue;
 		}
 
 		OutProperties.Add(ChildHandle.ToSharedRef());
 	}
+}
+
+bool FInstancedObjectPropertyCustomization::ResolveTemplateContext(const IPropertyHandle& PropertyHandle)
+{
+	// IsAsset() is not template context: Enhanced Input declares its modifier settings EditInstanceOnly inside UDataAsset instances.
+	UObject* Value = nullptr;
+	if (PropertyHandle.GetValue(Value) == FPropertyAccess::Success && Value)
+	{
+		return Value->IsTemplate(RF_ClassDefaultObject | RF_ArchetypeObject);
+	}
+
+	TArray<UObject*> OuterObjects;
+	PropertyHandle.GetOuterObjects(OuterObjects);
+	for (const UObject* Outer : OuterObjects)
+	{
+		if (Outer && Outer->IsTemplate(RF_ClassDefaultObject | RF_ArchetypeObject))
+		{
+			return true;
+		}
+	}
+
+	return false;
 }
 
 #pragma endregion
